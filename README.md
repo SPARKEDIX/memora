@@ -25,7 +25,7 @@ Memora is a smart memory layer for your AI applications. Unlike traditional vect
 
 ### Install
 ```bash
-pip install memora
+pip install git+https://github.com/SPARKEDIX/memora.git
 ```
 
 ### Basic Usage
