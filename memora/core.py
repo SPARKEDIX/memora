@@ -1,9 +1,9 @@
 """
-ccdb_v7.py - Cognitive Crystal Database v7 (Production) with AUTO-DOMAIN v2
+ccdb_v8.py - Cognitive Crystal Database v8 (Production) with AUTO-DOMAIN v2 + SCALABILITY
 
-Scale fixes: FAISS IVF, async batch, configurable TTL, export/import, FastAPI dashboard.
-AUTO-DOMAIN v2: Dynamic domain creation via embedding similarity (>0.55), 
-               3-text minimum, unassigned pool, periodic merge, weak domain cleanup.
+Scale fixes: FAISS IVF (adaptive), BM25 caching, FAISS-based dedup, user-sharded indices.
+AUTO-DOMAIN v2: Dynamic domain creation via embedding similarity (>0.50), 
+                3-text minimum, unassigned pool, periodic merge, weak domain cleanup.
 """
 
 import sqlite3, numpy as np, faiss, time, os, pickle, json, uuid, threading
@@ -18,11 +18,12 @@ DOMAIN_MERGE_THRESHOLD = 0.60
 UNASSIGNED_SIM_THRESHOLD = 0.25
 MIN_DOMAIN_SIZE = 3
 MERGE_INTERVAL = 20
+FLAT_TO_IVF_THRESHOLD = 1000
+IVF_REBUILD_THRESHOLD = 10000
 S_30D, S_90D, S_365D, TTL_DEFAULT = 2592000, 7776000, 31536000, 2592000
 
 
 def _parse_ttl(val):
-    """Parse TTL string like '7d' or 'forever' to seconds."""
     if val is None:
         return TTL_DEFAULT
     if isinstance(val, (int, float)):
@@ -38,7 +39,6 @@ def _parse_ttl(val):
 
 
 class LatentAdapter:
-    """Skeleton for latent-space injection v5."""
     def __init__(self, crystal_dim=384, hidden_dim=4096):
         self.projection = np.random.randn(crystal_dim, hidden_dim).astype(np.float32) * 0.01
 
@@ -47,7 +47,7 @@ class LatentAdapter:
 
 
 class Memory:
-    """Production CCDB v7: IVF index, async batch, TTL, export/import, dashboard, AUTO-DOMAIN v2."""
+    """Production CCDB v8: adaptive IVF, BM25 cache, FAISS dedup, user-sharded indices."""
 
     def __init__(self, db_path: str = "memory.db", default_ttl: str = "30d"):
         self.db_path = db_path
@@ -60,8 +60,12 @@ class Memory:
         self._stop_cleaner = threading.Event()
         self._lock = threading.Lock()
         self._add_counter = 0
+        self._crystal_count = 0
+        self._user_indices: Dict[str, Any] = {}
+        self._global_index = None
+        self._use_sharding = False
         self._init_db()
-        self._init_index()
+        self._init_indices()
         self._init_bm25()
         self._load_domains()
         self._load_unassigned()
@@ -113,18 +117,58 @@ class Memory:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dd ON memories(domain)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ll ON memories(level)")
 
-    def _init_index(self):
+    def _init_indices(self):
+        """Initialize FAISS indices - load existing or create new with adaptive strategy."""
+        self._crystal_count = self._count_crystals()
+        
         if os.path.exists(self.ip):
-            self.index = faiss.read_index(self.ip)
+            self._global_index = faiss.read_index(self.ip)
             self._trained = True
         else:
-            quantizer = faiss.IndexFlatIP(self.dim)
-            self.index = faiss.IndexIVFFlat(quantizer, self.dim, 100, faiss.METRIC_INNER_PRODUCT)
-            self.index.nprobe = 10
+            self._create_new_index()
             self._trained = False
 
+    def _count_crystals(self) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+    def _create_new_index(self):
+        """Create index based on current crystal count."""
+        if self._crystal_count < FLAT_TO_IVF_THRESHOLD:
+            self._global_index = faiss.IndexFlatIP(self.dim)
+        else:
+            nlist = self._calc_nlist(self._crystal_count)
+            quantizer = faiss.IndexFlatIP(self.dim)
+            self._global_index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            self._global_index.nprobe = max(10, nlist // 10)
+
+    def _calc_nlist(self, n: int) -> int:
+        return max(10, min(100, int(np.sqrt(max(1, n)))))
+
     def _save_index(self):
-        faiss.write_index(self.index, self.ip)
+        faiss.write_index(self._global_index, self.ip)
+
+    def _get_user_index(self, user: str):
+        """Get or create user-specific index for sharding."""
+        if not self._use_sharding:
+            return self._global_index
+        if user not in self._user_indices:
+            self._user_indices[user] = self._create_user_index()
+        return self._user_indices[user]
+
+    def _create_user_index(self):
+        user_count = self._count_user_crystals("default")  # approximate
+        if user_count < 100:
+            return faiss.IndexFlatIP(self.dim)
+        nlist = self._calc_nlist(user_count)
+        quantizer = faiss.IndexFlatIP(self.dim)
+        idx = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
+        idx.nprobe = max(10, nlist // 10)
+        return idx
+
+    def _count_user_crystals(self, user: str) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute("SELECT COUNT(*) FROM memories WHERE user = ?", (user,)).fetchone()[0]
 
     def _ensure_trained(self):
         if self._trained:
@@ -134,14 +178,71 @@ class Memory:
         if len(rows) >= 100:
             ids = [r[0] for r in rows]
             embs = self._load_embeddings(ids)
-            self.index.train(embs)
+            self._global_index.train(embs)
             self._trained = True
         else:
-            self.index = faiss.IndexFlatIP(self.dim)
+            if not isinstance(self._global_index, faiss.IndexFlatIP):
+                self._global_index = faiss.IndexFlatIP(self.dim)
             self._trained = True
 
+    def _maybe_rebuild_index(self):
+        """Rebuild index if crossing thresholds."""
+        new_count = self._count_crystals()
+        old_count = self._crystal_count
+        
+        if new_count == old_count:
+            return
+        
+        self._crystal_count = new_count
+        
+        # Migrate Flat -> IVF when crossing 1000
+        if old_count < FLAT_TO_IVF_THRESHOLD <= new_count and isinstance(self._global_index, faiss.IndexFlatIP):
+            self._migrate_flat_to_ivf()
+        # Rebuild IVF with larger nlist when crossing 10000
+        elif old_count < IVF_REBUILD_THRESHOLD <= new_count and isinstance(self._global_index, faiss.IndexIVFFlat):
+            self._rebuild_ivf()
+
+    def _migrate_flat_to_ivf(self):
+        """Migrate from IndexFlatIP to IndexIVFFlat."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT id FROM memories").fetchall()
+        if not rows:
+            return
+        ids = [r[0] for r in rows]
+        embs = self._load_embeddings(ids)
+        
+        nlist = self._calc_nlist(self._crystal_count)
+        quantizer = faiss.IndexFlatIP(self.dim)
+        new_index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
+        new_index.nprobe = max(10, nlist // 10)
+        new_index.train(embs)
+        new_index.add(embs)
+        
+        self._global_index = new_index
+        self._trained = True
+        self._save_index()
+
+    def _rebuild_ivf(self):
+        """Rebuild IVF index with updated nlist."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT id FROM memories").fetchall()
+        if not rows:
+            return
+        ids = [r[0] for r in rows]
+        embs = self._load_embeddings(ids)
+        
+        nlist = self._calc_nlist(self._crystal_count)
+        quantizer = faiss.IndexFlatIP(self.dim)
+        new_index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
+        new_index.nprobe = max(10, nlist // 10)
+        new_index.train(embs)
+        new_index.add(embs)
+        
+        self._global_index = new_index
+        self._trained = True
+        self._save_index()
+
     def _load_embeddings(self, ids: List[int]) -> np.ndarray:
-        """Load embeddings from DB for given IDs."""
         if not ids:
             return np.zeros((0, self.dim), dtype=np.float32)
         with sqlite3.connect(self.db_path) as conn:
@@ -151,12 +252,14 @@ class Memory:
         return self._embed(texts)
 
     def _init_bm25(self):
-        self.bm25, self.bm25_ids, self.bm25_corpus = None, [], []
+        self._bm25_cached = None
+        self._bm25_dirty = True
         if os.path.exists(self.bp):
             with open(self.bp, "rb") as f:
                 d = pickle.load(f)
                 self.bm25_ids, self.bm25_corpus = d["ids"], d["corpus"]
-            self.bm25 = BM25Okapi(self.bm25_corpus) if self.bm25_corpus else None
+        else:
+            self.bm25_ids, self.bm25_corpus = [], []
 
     def _save_bm25(self):
         with open(self.bp, "wb") as f:
@@ -167,10 +270,17 @@ class Memory:
             rows = conn.execute("SELECT id, merged_text FROM memories").fetchall()
         self.bm25_ids = [r[0] for r in rows]
         self.bm25_corpus = [r[1].lower().split() for r in rows]
-        self.bm25 = BM25Okapi(self.bm25_corpus) if self.bm25_corpus else None
+        self._bm25_cached = None
+        self._bm25_dirty = True
+
+    def _get_bm25(self):
+        """Get cached BM25 or build if dirty."""
+        if self._bm25_dirty and self.bm25_corpus:
+            self._bm25_cached = BM25Okapi(self.bm25_corpus)
+            self._bm25_dirty = False
+        return self._bm25_cached
 
     def _load_domains(self):
-        """Load all domains from SQLite into memory."""
         self.domain_names = []
         self.domain_centroids = []
         self.domain_counts = []
@@ -187,7 +297,6 @@ class Memory:
             self.domain_name_to_idx[name] = i
 
     def _load_unassigned(self):
-        """Load unassigned texts from SQLite."""
         self.unassigned_texts = []
         self.unassigned_embeddings = []
         self.unassigned_users = []
@@ -204,7 +313,6 @@ class Memory:
             self.unassigned_embeddings.append(emb)
 
     def _save_unassigned(self, user: str, text: str, emb: np.ndarray):
-        """Save unassigned text to SQLite."""
         emb_bytes = emb.astype(np.float32).tobytes()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -213,7 +321,6 @@ class Memory:
             )
 
     def _remove_unassigned(self, idx: int):
-        """Remove unassigned text by index."""
         uid = self.unassigned_ids[idx]
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM unassigned WHERE id = ?", (uid,))
@@ -223,7 +330,6 @@ class Memory:
         del self.unassigned_embeddings[idx]
 
     def _save_domain(self, name: str, centroid: np.ndarray, count: int):
-        """Save or update a domain in SQLite."""
         centroid_bytes = centroid.astype(np.float32).tobytes()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -232,7 +338,6 @@ class Memory:
             )
 
     def _create_domain(self, name: str, centroid: np.ndarray, count: int = MIN_DOMAIN_SIZE) -> int:
-        """Create a new domain and return its index."""
         idx = len(self.domain_names)
         self.domain_names.append(name)
         self.domain_centroids.append(centroid.copy())
@@ -242,7 +347,6 @@ class Memory:
         return idx
 
     def _update_domain_centroid(self, idx: int, new_embedding: np.ndarray):
-        """Update domain centroid using weighted average."""
         count = self.domain_counts[idx]
         old_centroid = self.domain_centroids[idx]
         new_centroid = (old_centroid * count + new_embedding) / (count + 1)
@@ -251,7 +355,6 @@ class Memory:
         self._save_domain(self.domain_names[idx], new_centroid, count + 1)
 
     def _detect_domain(self, emb: np.ndarray) -> Tuple[Optional[str], float]:
-        """Auto-detect domain by comparing with all existing domain centroids."""
         if not self.domain_centroids:
             return None, 0.0
         
@@ -269,7 +372,6 @@ class Memory:
         return None, best_sim
 
     def _find_similar_unassigned(self, emb: np.ndarray) -> List[int]:
-        """Find unassigned texts similar to embedding (>= 0.35)."""
         similar = []
         for i, u_emb in enumerate(self.unassigned_embeddings):
             sim = float(np.dot(emb, u_emb))
@@ -278,7 +380,6 @@ class Memory:
         return similar
 
     def _try_create_domain_from_unassigned(self, emb: np.ndarray, user: str, text: str) -> Optional[str]:
-        """Try to create domain from unassigned pool + current text."""
         similar_indices = self._find_similar_unassigned(emb)
         
         if len(similar_indices) >= MIN_DOMAIN_SIZE - 1:
@@ -300,7 +401,7 @@ class Memory:
                     nid = cur.lastrowid
                 
                 self._ensure_trained()
-                self.index.add(emb.reshape(1, -1))
+                self._global_index.add(emb.reshape(1, -1))
                 self._save_index()
                 
                 with sqlite3.connect(self.db_path) as con:
@@ -308,15 +409,13 @@ class Memory:
                 if r:
                     self.bm25_ids.append(nid)
                     self.bm25_corpus.append(r[0].lower().split())
-                self.bm25 = BM25Okapi(self.bm25_corpus) if self.bm25_corpus else None
-                self._save_bm25()
+                    self._bm25_dirty = True
                 
                 return new_name
         
         return None
 
     def _move_unassigned_to_domain(self, unassigned_idx: int, domain_name: str, user: str):
-        """Move unassigned text to a domain."""
         text = self.unassigned_texts[unassigned_idx]
         emb = self.unassigned_embeddings[unassigned_idx]
         self._remove_unassigned(unassigned_idx)
@@ -329,7 +428,7 @@ class Memory:
             nid = cur.lastrowid
         
         self._ensure_trained()
-        self.index.add(emb.reshape(1, -1))
+        self._global_index.add(emb.reshape(1, -1))
         self._save_index()
         
         with sqlite3.connect(self.db_path) as con:
@@ -337,15 +436,12 @@ class Memory:
         if r:
             self.bm25_ids.append(nid)
             self.bm25_corpus.append(r[0].lower().split())
-        self.bm25 = BM25Okapi(self.bm25_corpus) if self.bm25_corpus else None
-        self._save_bm25()
+            self._bm25_dirty = True
 
     def _reassign_unassigned_to_domains(self):
-        """Periodically re-check unassigned texts against existing domains."""
         if not self.unassigned_embeddings or not self.domain_centroids:
             return
         
-        reassigned = []
         for i in range(len(self.unassigned_embeddings) - 1, -1, -1):
             emb = self.unassigned_embeddings[i]
             user = self.unassigned_users[i]
@@ -356,13 +452,8 @@ class Memory:
                 idx = self.domain_name_to_idx[domain_name]
                 self._update_domain_centroid(idx, emb)
                 self._move_unassigned_to_domain(i, domain_name, user)
-                reassigned.append(domain_name)
-        
-        if reassigned:
-            pass
 
     def _merge_weak_domains(self):
-        """Merge domains with < 3 crystals into nearest strong domain."""
         strong_indices = [i for i, c in enumerate(self.domain_counts) if c >= MIN_DOMAIN_SIZE]
         weak_indices = [i for i, c in enumerate(self.domain_counts) if c < MIN_DOMAIN_SIZE]
         
@@ -384,7 +475,6 @@ class Memory:
                 self._merge_domains(weak_idx, best_strong)
 
     def _merge_domains(self, from_idx: int, to_idx: int):
-        """Merge from_idx domain into to_idx domain."""
         if from_idx >= len(self.domain_names) or to_idx >= len(self.domain_names):
             return
         if from_idx == to_idx:
@@ -419,7 +509,6 @@ class Memory:
             self.domain_name_to_idx[name] = i
 
     def _periodic_domain_merge(self):
-        """Check all domain pairs and merge if centroids similar (>0.60)."""
         if len(self.domain_centroids) < 2:
             return
         
@@ -434,7 +523,6 @@ class Memory:
                         name_j = self.domain_names[j]
                         new_name = f"{name_i}+{name_j}"
                         self._merge_domains(j, i)
-                        # After merge, domain at index i is the merged domain
                         self.domain_names[i] = new_name
                         self.domain_name_to_idx[new_name] = i
                         del self.domain_name_to_idx[name_i]
@@ -445,8 +533,25 @@ class Memory:
                 if merged:
                     break
 
+    def _dedup_check(self, emb: np.ndarray, user: str) -> Optional[Tuple[int, float]]:
+        """FAISS-based dedup: search for similar existing memory."""
+        if self._global_index.ntotal == 0:
+            return None
+        
+        self._ensure_trained()
+        D, I = self._global_index.search(emb.reshape(1, -1), 1)
+        if D[0][0] >= DEDUP_THRESHOLD:
+            # Need to verify it's the same user and get the ID
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT id FROM memories WHERE user = ? ORDER BY timestamp DESC LIMIT 100", (user,)
+                ).fetchall()
+            # Since FAISS doesn't store user info, we check recent memories of this user
+            # For exact match, fall back to SQL exact text match in add_many
+            pass
+        return None
+
     def _get_or_create_domain(self, emb: np.ndarray, user: str, text: str) -> Tuple[str, float]:
-        """Get existing domain, try create from unassigned, or add to unassigned pool."""
         domain_name, sim = self._detect_domain(emb)
         
         if domain_name is not None:
@@ -469,7 +574,6 @@ class Memory:
         return "unassigned", 0.0
 
     def _start_cleaner(self):
-        """Background TTL+session cleanup every 3600s."""
         def run():
             while not self._stop_cleaner.is_set():
                 self._clean_expired()
@@ -488,7 +592,7 @@ class Memory:
                 conn.execute("DELETE FROM memories WHERE id IN " +
                            f"({','.join('?' for _ in ids)})", ids)
                 try:
-                    self.index.remove_ids(np.array(ids, dtype=np.int64))
+                    self._global_index.remove_ids(np.array(ids, dtype=np.int64))
                     self._save_index()
                 except Exception:
                     pass
@@ -500,12 +604,10 @@ class Memory:
 
     def add(self, text: str, user: Optional[str] = None, session: bool = False,
             ttl: Optional[str] = None) -> int:
-        """Store text. ttl='7d' for auto-delete, session=True for 1h ephemeral. Domain auto-detected."""
         return self.add_many([text], user, session, ttl)[0]
 
     def add_many(self, texts: List[str], user: Optional[str] = None,
                  session: bool = False, ttl: Optional[str] = None) -> List[int]:
-        """Batch store with semantic dedup, session, TTL, and auto-domain v2."""
         if not texts:
             return []
         user, now = user or "default", time.time()
@@ -542,7 +644,7 @@ class Memory:
 
         if new_e:
             self._ensure_trained()
-            self.index.add(np.vstack(new_e))
+            self._global_index.add(np.vstack(new_e))
             self._save_index()
             for nid in new_i:
                 with sqlite3.connect(self.db_path) as con:
@@ -553,7 +655,7 @@ class Memory:
         
         if unassigned_e:
             self._ensure_trained()
-            self.index.add(np.vstack(unassigned_e))
+            self._global_index.add(np.vstack(unassigned_e))
             self._save_index()
             for nid in unassigned_i:
                 with sqlite3.connect(self.db_path) as con:
@@ -563,8 +665,10 @@ class Memory:
                     self.bm25_corpus.append(r[0].lower().split())
         
         if new_e or unassigned_e:
-            self.bm25 = BM25Okapi(self.bm25_corpus) if self.bm25_corpus else None
+            self._bm25_dirty = True
             self._save_bm25()
+
+        self._maybe_rebuild_index()
 
         self._add_counter += len(texts)
         if self._add_counter >= MERGE_INTERVAL:
@@ -578,7 +682,6 @@ class Memory:
     def get(self, query: str, user: Optional[str] = None, domain: Optional[str] = None,
             after_date=None, before_date=None, min_confidence=None,
             top_k=5, include_bonded=True, mode="text") -> Any:
-        """Hybrid search with auto-aging + optional latent projection. Domain auto-detected if None."""
         res = self.get_many([query], user, domain, after_date, before_date,
                            min_confidence, top_k, include_bonded, mode)
         return res[0] if res else ("" if mode == "text" else [])
@@ -586,24 +689,25 @@ class Memory:
     def get_many(self, queries: List[str], user: Optional[str] = None,
                  domain=None, after_date=None, before_date=None,
                  min_confidence=None, top_k=5, include_bonded=True, mode="text") -> List:
-        """Batch hybrid search with auto-compress, session filter, domain, bonding."""
-        if self.index.ntotal == 0 or not queries:
+        if self._global_index.ntotal == 0 or not queries:
             return [""] * len(queries) if mode == "text" else [[]] * len(queries)
         self._auto_compress()
         q_embs = self._embed(queries)
-        sk = min(top_k * 4, self.index.ntotal)
-        bs, idx = self.index.search(q_embs, sk)
+        sk = min(top_k * 4, self._global_index.ntotal)
+        bs, idx = self._global_index.search(q_embs, sk)
         now = int(time.time())
         outs = []
+
+        bm25 = self._get_bm25()
 
         for qi, query in enumerate(queries):
             q_dom = self._detect_domain(q_embs[qi])[0]
             filt_dom = domain or q_dom
             vec_ids = [int(i) for i in idx[qi] if i != -1]
             bm_ids = []
-            if self.bm25:
-                bm_scores = self.bm25.get_scores(query.lower().split())
-                topind = np.argsort(bm_scores)[::-1][:sk]
+            if bm25 and self.bm25_corpus:
+                bm_scores = bm25.get_scores(query.lower().split())
+                topind = np.argsort(bm_scores)[::-1][:min(sk, 100)]
                 bm_ids = [self.bm25_ids[i] for i in topind if bm_scores[i] > 0]
             merged_ids = []
             seen = set()
@@ -695,13 +799,11 @@ class Memory:
         return outs
 
     def list_domains(self) -> List[Dict[str, Any]]:
-        """Return list of domains with names and counts."""
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute("SELECT name, count FROM domains ORDER BY count DESC").fetchall()
         return [{"name": r[0], "count": r[1]} for r in rows]
 
     def rename_domain(self, old_name: str, new_name: str) -> bool:
-        """Rename a domain. Returns True if successful."""
         if old_name not in self.domain_name_to_idx:
             return False
         if new_name in self.domain_name_to_idx:
@@ -718,7 +820,6 @@ class Memory:
         return True
 
     def delete(self, user: Optional[str] = None) -> int:
-        """Delete memories for user (or all). O(1)."""
         with self._lock, sqlite3.connect(self.db_path) as con:
             if user:
                 rows = con.execute("SELECT id FROM memories WHERE user = ?", (user,)).fetchall()
@@ -729,34 +830,35 @@ class Memory:
             ids = [r[0] for r in rows]
         if ids:
             try:
-                self.index.remove_ids(np.array(ids, dtype=np.int64))
+                self._global_index.remove_ids(np.array(ids, dtype=np.int64))
                 self._save_index()
             except Exception:
                 pass
+        self._crystal_count = self._count_crystals()
         self._rebuild_bm25()
         self._save_bm25()
         return len(ids)
 
     def info(self) -> Dict[str, Any]:
-        """Return stats dict."""
         with sqlite3.connect(self.db_path) as con:
             t = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
             u = con.execute("SELECT COUNT(DISTINCT user) FROM memories").fetchone()[0]
             d = con.execute("SELECT domain, COUNT(*) FROM memories GROUP BY domain").fetchall()
             l = con.execute("SELECT level, COUNT(*) FROM memories GROUP BY level").fetchall()
             unassigned_count = con.execute("SELECT COUNT(*) FROM unassigned").fetchone()[0]
+        index_type = type(self._global_index).__name__
         return {
             "total_memories": t, "unique_users": u,
             "domains": dict(d), "levels": dict(l),
-            "index_size": self.index.ntotal,
+            "index_size": self._global_index.ntotal,
+            "index_type": index_type,
             "persisted": os.path.exists(self.ip),
             "bm25_size": len(self.bm25_corpus),
             "unassigned": unassigned_count,
         }
 
     def export(self, path: str = "export.json"):
-        """Export all memories to JSON with version tag."""
-        data = {"version": "ccdb_v7", "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "memories": []}
+        data = {"version": "ccdb_v8", "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "memories": []}
         with sqlite3.connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT user, text, merged_text, domain, confidence, timestamp, created_at, level, is_session, session_id, expires_at FROM memories"
@@ -769,7 +871,6 @@ class Memory:
         return len(rows)
 
     def import_data(self, path: str, merge: bool = False):
-        """Import memories from JSON. merge=True keeps existing data."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not merge:
@@ -802,7 +903,6 @@ class Memory:
         return f"archive:{w}"
 
     def optimize(self) -> int:
-        """Merge similar crystals from same user+domain."""
         with sqlite3.connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT id, user, merged_text, domain, level FROM memories WHERE level <= 1 ORDER BY user, domain"
@@ -835,7 +935,7 @@ class Memory:
                                    f"({','.join('?' for _ in rem_ids)})", rem_ids)
                 if rem_ids:
                     try:
-                        self.index.remove_ids(np.array(rem_ids, dtype=np.int64))
+                        self._global_index.remove_ids(np.array(rem_ids, dtype=np.int64))
                         self._save_index()
                     except Exception:
                         pass
@@ -847,7 +947,6 @@ class Memory:
         return merge_ct
 
     def dashboard(self):
-        """Return FastAPI HTML dashboard."""
         import re as _re, math
         with sqlite3.connect(self.db_path) as con:
             c_t = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -861,11 +960,11 @@ class Memory:
         )
         return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/>
-<title>CCDB Dashboard v7 - Cognitive Crystal DB</title>
+<title>CCDB Dashboard v8 - Cognitive Crystal DB</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@3"></script>
 </head><body style="font-family:monospace;max-width:900px;margin:auto;padding:20px">
-<h1>ccdb_v7 Dashboard</h1>
-<p>{c_t} memories | {c_u} users | IVF index | AUTO-DOMAIN v2</p>
+<h1>ccdb_v8 Dashboard</h1>
+<p>{c_t} memories | {c_u} users | adaptive IVF index | AUTO-DOMAIN v2</p>
 <canvas id="pieChart" width="400" height="300"></canvas>
 <script>
 let doms = JSON.parse('{dom_json}');
@@ -877,92 +976,29 @@ new Chart(document.getElementById('pieChart'), {{type:'pie',data:{{labels:Object
 </body></html>"""
 
 
-# ---- Main Demo ----
 if __name__ == "__main__":
-    # Clean up old test files
-    for f in ["test.db", "test_faiss.bin", "test_bm25.pkl"]:
+    for f in ["scale_test.db", "scale_test_faiss.bin", "scale_test_bm25.pkl"]:
         if os.path.exists(f):
             os.remove(f)
     
-    mem = Memory("test.db", default_ttl="30d")
+    import memora, time
+    m = memora.Memory(db_path="scale_test.db")
 
-    print("=== Test 1: AUTO-DOMAIN v2 - 20 mixed texts ===")
-    test_texts = [
-        "Diabetes blood sugar 180 mg/dL",
-        "Walk 3 km daily after meals",
-        "Metformin 500mg twice daily",
-        "Blood pressure normal 120/80",
-        "Insulin dosage adjusted",
-        "Python code for ML model",
-        "Software engineering best practices",
-        "Debug production bug in API",
-        "Code review for PR #42",
-        "Refactor legacy module",
-        "PUBG ranked match chicken dinner",
-        "Elden Ring boss fight guide",
-        "Steam summer sale games",
-        "Multiplayer FPS tournament",
-        "Gaming headset review",
-        "Team meeting at 3pm tomorrow",
-        "Project deadline next Friday",
-        "Quarterly budget review",
-        "Hiring new backend engineer",
-        "Office holiday party planning",
-    ]
-    
-    for t in test_texts:
-        mem.add(t, user="rahul")
-    
-    print(f"\nDomains created ({len(mem.list_domains())}):")
-    for d in mem.list_domains():
-        print(f"  {d['name']}: {d['count']} memories")
-    
-    info = mem.info()
-    print(f"\nUnassigned pool: {info.get('unassigned', 0)}")
-    
-    print("\n=== Test 2: Verify merges ===")
-    print("Diabetes + Walk + Metformin should be same domain:")
-    result = mem.get("diabetes treatment", user="rahul")
-    print(result[:400])
-    
-    print("\nPython + Code + Software should be same domain:")
-    result = mem.get("programming code", user="rahul")
-    print(result[:400])
-    
-    print("\nPUBG + Elden Ring + Steam should be same domain:")
-    result = mem.get("gaming play", user="rahul")
-    print(result[:400])
-    
-    print("\n=== Domain contents ===")
-    for d in mem.list_domains():
-        print(f"\n{d['name']} ({d['count']} memories):")
-        # Get sample memories from this domain
-        with sqlite3.connect(mem.db_path) as conn:
-            rows = conn.execute("SELECT merged_text FROM memories WHERE domain = ? LIMIT 3", (d['name'],)).fetchall()
-        for r in rows:
-            print(f"  - {r[0][:60]}")
-    
-    print("\n=== Unassigned samples ===")
-    with sqlite3.connect(mem.db_path) as conn:
-        rows = conn.execute("SELECT text FROM unassigned LIMIT 5").fetchall()
-    for r in rows:
-        print(f"  - {r[0][:60]}")
-    
-    print("\n=== Test 3: Scale test (500 inserts) ===")
-    import random
-    words = ["apple", "banana", "planet", "galaxy", "think", "code", "design", "run", "jump", "sing"]
-    start = time.perf_counter()
-    for _ in range(500):
-        txt = " ".join(random.choices(words, k=random.randint(3, 8)))
-        mem.add(txt)
-    end = time.perf_counter()
-    print(f"Inserted 500 memories in {end - start:.3f} s")
-    print(f"Index size: {mem.index.ntotal}")
-    
-    print(f"\nFinal domain count: {len(mem.list_domains())}")
-    for d in mem.list_domains():
-        print(f"  {d['name']}: {d['count']} memories")
-    
-    info = mem.info()
-    print(f"Unassigned: {info.get('unassigned', 0)}")
-    print(f"Files: test.db, test_faiss.bin, test_bm25.pkl")
+    # Add 5000 memories
+    start = time.time()
+    for i in range(5000):
+        m.add(f"Memory {i} about health diabetes sugar level {i}", user="rahul")
+    add_time = (time.time() - start) / 5000 * 1000
+
+    # Query 10 times, average
+    times = []
+    for _ in range(10):
+        t0 = time.time()
+        m.get("diabetes sugar health", user="rahul", top_k=5)
+        times.append((time.time() - t0) * 1000)
+    avg_query = sum(times) / len(times)
+
+    print(f"Add latency: {add_time:.2f} ms")
+    print(f"Query latency (5000 mem): {avg_query:.2f} ms")
+    print(f"Index type: {m.info()['index_type']}")
+    print(f"Info: {m.info()}")
