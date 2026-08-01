@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(
-    name="memora",
+    name="memora-ai",
     version="0.1.0",
     description="Smart LLM memory with dedup and hybrid search",
     author="Kartik",
