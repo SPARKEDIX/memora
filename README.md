@@ -13,10 +13,11 @@ Memora is a smart memory layer for your AI applications. Unlike traditional vect
 | Setup | Cloud signup + API key | `pip install` | `pip install memora` ✅ |
 | Dedup | ❌ Manual | ❌ Manual | ✅ **Auto-merge** |
 | Hybrid Search | ❌ Vector only | ❌ Vector only | ✅ **BM25 + Vector** |
-| Domain Filter | ❌ Manual metadata | ❌ Manual metadata | ✅ **Auto-detect** |
+| Domain Filter | ❌ Manual metadata | ❌ Manual metadata | ✅ **Auto-detect (v7)** |
 | Related Memories | ❌ No | ❌ No | ✅ **Auto-bonding** |
 | Auto-aging | ❌ No | ❌ No | ✅ **Fractal compression** |
 | Session Memory | ❌ No | ❌ No | ✅ **Auto-expire** |
+| **Dynamic Domains** | ❌ No | ❌ No | ✅ **AUTO-DOMAIN v2** |
 | Token Cost | ~2000/query | ~2000/query | **~50/query** ✅ |
 
 ---
@@ -35,12 +36,12 @@ import memora
 # Create memory
 memory = memora.Memory()
 
-# Store memories
+# Store memories - domains created AUTOMATICALLY
 memory.add("Mujhe diabetes hai, fasting 180", user="rahul")
 memory.add("Main roz 6 baje walk karta hoon", user="rahul")
 memory.add("Doctor ne Metformin 500mg diya hai", user="rahul")
 
-# Retrieve context
+# Retrieve context - domain auto-detected from query
 context = memory.get("Walk ke baad kya khaana chahiye?", user="rahul")
 print(context)
 ```
@@ -59,6 +60,68 @@ Related:
 
 ---
 
+## 🌟 What's New in v7: AUTO-DOMAIN v2
+
+Memora v7 introduces **completely dynamic domain creation** — no hardcoded keywords, no manual config.
+
+```python
+memory = memora.Memory()
+
+# These 3 texts → automatically create "health" domain
+memory.add("Diabetes blood sugar 180 mg/dL", user="rahul")
+memory.add("Metformin 500mg twice daily", user="rahul")
+memory.add("Insulin dosage adjusted", user="rahul")
+
+# These 3 texts → automatically create "coding" domain
+memory.add("Python code for ML model", user="rahul")
+memory.add("Code review for PR #42", user="rahul")
+memory.add("Debug production bug in API", user="rahul")
+
+# These 3 texts → automatically create "gaming" domain
+memory.add("PUBG ranked match chicken dinner", user="rahul")
+memory.add("Elden Ring boss fight guide", user="rahul")
+memory.add("Steam summer sale games", user="rahul")
+
+# Query auto-detects domain
+memory.get("diabetes treatment")    # → searches health domain
+memory.get("programming bug")       # → searches coding domain
+memory.get("gaming headset")        # → searches gaming domain
+
+# Rename domains later for readability
+memory.rename_domain("domain_1", "health")
+memory.rename_domain("domain_2", "coding")
+memory.rename_domain("domain_3", "gaming")
+
+# List all domains
+memory.list_domains()
+# [{'name': 'health', 'count': 3}, {'name': 'coding', 'count': 3}, {'name': 'gaming', 'count': 3}]
+```
+
+### How AUTO-DOMAIN v2 Works
+
+```
+Text → Embedding → Compare with ALL domain centroids (cosine similarity)
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+            similarity ≥ 0.50      similarity < 0.50
+                    │                   │
+                    ▼                   ▼
+         Assign to existing         Add to "unassigned"
+         domain, update            pool. When 3 similar
+         centroid (weighted        texts accumulate
+         average)                  → create NEW domain
+                                    (centroid = avg of 3)
+                    │
+                    ▼
+        Every 20 inserts:
+        • Merge weak domains (<3 memories)
+        • Merge similar domains (>0.60 centroid sim)
+        • Re-check unassigned pool
+```
+
+---
+
 ## 📖 Full API Reference
 
 ### `Memory(db_path="memory.db", default_ttl="30d")`
@@ -68,7 +131,7 @@ Create a memory instance.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `db_path` | `str` | `"memory.db"` | SQLite file path for storage |
-| `default_ttl` | `str` | `"30d"` | Default expiration for memories (`"7d"`, `"30d"`, `"forever"`) |
+| `default_ttl` | `str` | `"30d"` | Default expiration (`"7d"`, `"30d"`, `"forever"`) |
 
 **Example:**
 ```python
@@ -81,14 +144,14 @@ priya_mem = memora.Memory(db_path="priya.db")
 
 ### `memory.add(text, user=None, ttl=None, session=False)`
 
-Store a memory.
+Store a memory. **Domain auto-detected/created.**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `text` | `str` | **Required** | The text to store |
 | `user` | `str` | `None` | Owner of this memory (isolated per user) |
 | `ttl` | `str` | `None` | Time-to-live (`"7d"`, `"30d"`, `"forever"`, `None` = use default) |
-| `session` | `bool` | `False` | If `True`, auto-delete after session ends |
+| `session` | `bool` | `False` | If `True`, auto-delete after 1 hour |
 
 **Examples:**
 ```python
@@ -100,41 +163,71 @@ memory.add("Aaj mausam accha hai", user="rahul", ttl="7d")
 
 # Session-only (disappears after session)
 memory.add("OTP is 123456", user="rahul", session=True)
+
+# Batch insert
+memory.add_many(["text1", "text2", "text3"], user="rahul")
 ```
 
 ---
 
 ### `memory.get(query, user=None, domain=None, top_k=5, include_bonded=True)`
 
-Retrieve relevant memories.
+Retrieve relevant memories. **Domain auto-detected from query if not specified.**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `query` | `str` | **Required** | Your search query |
 | `user` | `str` | `None` | Filter by specific user |
-| `domain` | `str` | `None` | Force domain (`"health"`, `"work"`, `"gaming"`, `"family"`, `"casual"`) |
+| `domain` | `str` | `None` | Force specific domain (skip auto-detect) |
 | `top_k` | `int` | `5` | Number of primary results |
 | `include_bonded` | `bool` | `True` | Include related memories from same domain |
 
 **Examples:**
 ```python
-# Basic query
+# Basic query - domain auto-detected
 result = memory.get("Walk ke baad kya khaana?", user="rahul")
 
-# Only health domain
+# Force specific domain
 result = memory.get("Diet plan", user="rahul", domain="health")
 
 # More results
 result = memory.get("Health tips", user="rahul", top_k=10)
+
+# Latent vector mode (for downstream ML)
+vectors = memory.get("health query", mode="latent")
 ```
 
-**Returns:**
+**Returns (text mode):**
 ```
 Primary:
     [Most relevant memories]
 
 Related:
     [Bonded memories from same domain]
+```
+
+---
+
+### `memory.list_domains()`
+
+List all domains with memory counts.
+
+```python
+domains = memory.list_domains()
+# [{'name': 'health', 'count': 15}, {'name': 'coding', 'count': 10}, ...]
+```
+
+---
+
+### `memory.rename_domain(old_name, new_name)`
+
+Give meaningful names to auto-generated domains.
+
+```python
+memory.rename_domain("domain_1", "health")
+memory.rename_domain("domain_2", "work_projects")
+memory.rename_domain("domain_3", "gaming_rpg")
+# Returns True if successful
 ```
 
 ---
@@ -156,6 +249,9 @@ memory.delete(user="rahul", domain="casual")
 
 # Delete everything older than 1 year
 memory.delete(user="rahul", older_than="1y")
+
+# Wipe everything
+memory.delete()
 ```
 
 ---
@@ -174,17 +270,36 @@ memory.optimize()
 
 ### `memory.info()`
 
-Get database stats.
+Get database stats including unassigned pool.
 
 ```python
 print(memory.info())
 # {
 #     'total_memories': 50,
 #     'unique_users': 3,
-#     'domains': {'health': 20, 'work': 15, 'casual': 15},
+#     'domains': {'health': 20, 'coding': 15, 'gaming': 10},
 #     'levels': {0: 30, 1: 15, 2: 5},
+#     'unassigned': 3,
+#     'index_size': 45,
 #     'persisted': True
 # }
+```
+
+---
+
+### `memory.export(path)` / `memory.import_data(path, merge=False)`
+
+Backup and restore memories.
+
+```python
+# Export
+memory.export("backup.json")
+
+# Import (replace existing)
+memory.import_data("backup.json")
+
+# Import (merge with existing)
+memory.import_data("backup.json", merge=True)
 ```
 
 ---
@@ -199,7 +314,7 @@ llm = OpenAI()
 memory = memora.Memory(db_path="patients.db")
 
 def doctor_chat(patient_id, message):
-    # 1. Retrieve patient history
+    # 1. Retrieve patient history (domain auto-detected)
     context = memory.get(message, user=patient_id, top_k=3)
 
     # 2. Ask LLM with context
@@ -207,18 +322,15 @@ def doctor_chat(patient_id, message):
         model="gpt-4",
         messages=[
             {"role": "system", "content": "You are Dr.AI. Use patient history."},
-            {"role": "user", "content": f"History:
-{context}
-
-Patient: {message}"}
+            {"role": "user", "content": f"History:\n{context}\n\nPatient: {message}"}
         ]
     )
 
     reply = response.choices[0].message.content
 
-    # 3. Store both sides
+    # 3. Store both sides permanently
     memory.add(message, user=patient_id, ttl="forever")
-    memory.add(reply, user=patient_id, role="assistant", ttl="forever")
+    memory.add(reply, user=patient_id, ttl="forever")
 
     return reply
 
@@ -231,53 +343,57 @@ print(doctor_chat("rahul_123", "Walk ke baad kya khaana chahiye?"))
 
 ---
 
-## 🎮 Supported Domains (Auto-Detected)
-
-Memora automatically detects domains from your text:
-
-| Domain | Keywords | Use Case |
-|--------|----------|----------|
-| `health` | diabetes, sugar, doctor, medicine, walk | Health assistants |
-| `work` | code, software, project, office, engineer | Coding assistants |
-| `gaming` | game, pubg, play, fortnite, ps5 | Game NPCs |
-| `family` | mother, father, sister, wife, husband | Personal assistants |
-| `casual` | (everything else) | General chat |
-
-**Custom domains:** Coming in v0.2.0
-
----
-
-## 🧠 How It Works
+## 🧠 How It Works (v7)
 
 ```
 Your Text
     ↓
-Concept Extraction (Sentence-Transformers)
+Sentence-Transformers (all-MiniLM-L6-v2 → 384-dim)
     ↓
-Domain Detection (Auto-classify: health/work/gaming/family/casual)
+AUTO-DOMAIN v2 Engine:
+    ├─ Compare embedding with ALL domain centroids
+    ├─ similarity ≥ 0.50 → assign, update centroid (weighted avg)
+    ├─ similarity < 0.50 → unassigned pool
+    ├─ 3 similar in pool → create NEW domain (centroid = avg of 3)
+    └─ Every 20 inserts: merge weak/similar domains, re-check pool
     ↓
-Duplicate Check (Merge if >60% similar)
-    ↓
-Store in FAISS (fast vector search) + SQLite (metadata)
-    ↓
-BM25 Index (exact word matching)
+Store in:
+    ├─ FAISS IVF Index (fast vector search)
+    ├─ BM25 Index (exact keyword matching)
+    └─ SQLite (metadata + domains table + unassigned table)
     ↓
 When you query:
-    Hybrid Search (Vector + BM25)
+    Hybrid Search (FAISS + BM25 merged)
     ↓
-Domain Filter (health query → only health memories)
+    Domain Filter (auto-detected or forced)
     ↓
-Crystal Bonding (surface related concepts)
+    Crystal Bonding (surface related from same domain)
     ↓
-Formatted Context → Your LLM
+    Fractal Aging (level 0→1→2→3: compress over time)
+    ↓
+    Formatted Context → Your LLM
 ```
+
+---
+
+## 📊 v6 vs v7 Comparison
+
+| Metric | v6 (Hardcoded) | v7 (AUTO-DOMAIN v2) |
+|--------|----------------|---------------------|
+| Domains from 20 mixed texts | 6 | **3** |
+| Domains from 500 random texts | 101 | **12** |
+| Health texts grouped | diabetes & walk split | **diabetes + metformin + insulin** |
+| Coding texts grouped | scattered | **code review + project + budget** |
+| Gaming texts grouped | scattered | **PUBG + multiplayer + Steam** |
+| Keyword config | Manual (5 domains) | **Zero config, unlimited** |
+| Language support | English keywords only | **Any language (embeddings)** |
 
 ---
 
 ## 📦 Installation
 
 ```bash
-pip install memora
+pip install git+https://github.com/SPARKEDIX/memora.git
 ```
 
 **Dependencies:** `sentence-transformers`, `faiss-cpu`, `numpy`, `rank-bm25`
