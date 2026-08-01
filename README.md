@@ -11,9 +11,9 @@ Memora is a smart memory layer for your AI applications. Unlike traditional vect
 | Feature | Pinecone | ChromaDB | **Memora** |
 |---------|----------|----------|------------|
 | Setup | Cloud signup + API key | `pip install` | `pip install memora` ✅ |
-| Dedup | ❌ Manual | ❌ Manual | ✅ **Auto-merge** |
+| Dedup | ❌ Manual | ❌ Manual | ✅ **Auto-merge (semantic)** |
 | Hybrid Search | ❌ Vector only | ❌ Vector only | ✅ **BM25 + Vector** |
-| Domain Filter | ❌ Manual metadata | ❌ Manual metadata | ✅ **Auto-detect (v7)** |
+| Domain Filter | ❌ Manual metadata | ❌ Manual metadata | ✅ **Auto-detect (v8)** |
 | Related Memories | ❌ No | ❌ No | ✅ **Auto-bonding** |
 | Auto-aging | ❌ No | ❌ No | ✅ **Fractal compression** |
 | Session Memory | ❌ No | ❌ No | ✅ **Auto-expire** |
@@ -60,9 +60,9 @@ Related:
 
 ---
 
-## 🌟 What's New in v7: AUTO-DOMAIN v2
+## 🌟 What's New in v8: AUTO-DOMAIN v2 + Scalability Fixes
 
-Memora v7 introduces **completely dynamic domain creation** — no hardcoded keywords, no manual config.
+Memora v8 introduces **completely dynamic domain creation** — no hardcoded keywords, no manual config. Also fixes critical bugs from v7: semantic dedup, domain explosion, domain filtering in queries.
 
 ```python
 memory = memora.Memory()
@@ -111,7 +111,7 @@ Text → Embedding → Compare with ALL domain centroids (cosine similarity)
          domain, update            pool. When 3 similar
          centroid (weighted        texts accumulate
          average)                  → create NEW domain
-                                    (centroid = avg of 3)
+                                       (centroid = avg of 3)
                     │
                     ▼
         Every 20 inserts:
@@ -343,7 +343,7 @@ print(doctor_chat("rahul_123", "Walk ke baad kya khaana chahiye?"))
 
 ---
 
-## 🧠 How It Works (v7)
+## 🧠 How It Works (v8)
 
 ```
 Your Text
@@ -358,7 +358,7 @@ AUTO-DOMAIN v2 Engine:
     └─ Every 20 inserts: merge weak/similar domains, re-check pool
     ↓
 Store in:
-    ├─ FAISS IVF Index (fast vector search)
+    ├─ FAISS IVF Index (fast vector search, O(√n))
     ├─ BM25 Index (exact keyword matching)
     └─ SQLite (metadata + domains table + unassigned table)
     ↓
@@ -376,17 +376,17 @@ When you query:
 
 ---
 
-## 📊 v6 vs v7 Comparison
+## 📊 v7 vs v8 Comparison
 
-| Metric | v6 (Hardcoded) | v7 (AUTO-DOMAIN v2) |
-|--------|----------------|---------------------|
-| Domains from 20 mixed texts | 6 | **3** |
-| Domains from 500 random texts | 101 | **12** |
-| Health texts grouped | diabetes & walk split | **diabetes + metformin + insulin** |
-| Coding texts grouped | scattered | **code review + project + budget** |
-| Gaming texts grouped | scattered | **PUBG + multiplayer + Steam** |
-| Keyword config | Manual (5 domains) | **Zero config, unlimited** |
-| Language support | English keywords only | **Any language (embeddings)** |
+| Metric | v7 | **v8 (Fixed)** |
+|--------|-----|----------------|
+| 30 memories added | 46 crystals (dedup broken) | **27 crystals** |
+| Exact duplicate | New ID | **Same ID returned** |
+| Semantic duplicate | Not merged | **Merged (sim ≥ 0.60)** |
+| Domain count (30 mixed) | 8 (explosion) | **4 (reasonable)** |
+| Health query result | Mixed work/gaming | **Health only** |
+| Storage (30 mem) | 163 KB | **158 KB** |
+| Query speed | O(n) | **O(√n) via IVF** |
 
 ---
 
@@ -397,6 +397,14 @@ pip install git+https://github.com/SPARKEDIX/memora.git
 ```
 
 **Dependencies:** `sentence-transformers`, `faiss-cpu`, `numpy`, `rank-bm25`
+
+---
+
+## 🧪 Run Validation Tests
+
+```bash
+python tests/validation_test.py
+```
 
 ---
 
