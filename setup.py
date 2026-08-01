@@ -11,7 +11,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Kartik Sharma",
-    author_email="kartik@example.com",
+    author_email="kartiknaveen2007@gmail.com",
     url="https://github.com/SPARKEDIX/memora",
     packages=["memora"],
     package_dir={"memora": "memora"},
