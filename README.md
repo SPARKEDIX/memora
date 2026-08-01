@@ -10,7 +10,7 @@ Memora is a smart memory layer for your AI applications. Unlike traditional vect
 
 | Feature | Pinecone | ChromaDB | **Memora** |
 |---------|----------|----------|------------|
-| Setup | Cloud signup + API key | `pip install` | `pip install memora` ✅ |
+| Setup | Cloud signup + API key | `pip install` | `pip install memora-memory` ✅ |
 | Dedup | ❌ Manual | ❌ Manual | ✅ **Auto-merge (semantic)** |
 | Hybrid Search | ❌ Vector only | ❌ Vector only | ✅ **BM25 + Vector** |
 | Domain Filter | ❌ Manual metadata | ❌ Manual metadata | ✅ **Auto-detect (v8)** |
@@ -27,6 +27,9 @@ Memora is a smart memory layer for your AI applications. Unlike traditional vect
 ### Install
 ```bash
 pip install git+https://github.com/SPARKEDIX/memora.git
+
+
+pip install memora-memory
 ```
 
 ### Basic Usage
